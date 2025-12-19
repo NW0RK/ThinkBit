@@ -7,14 +7,32 @@ if ! command -v ffmpeg &> /dev/null; then
     exit 1
 fi
 
+# Determine Python command
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    echo "Error: Python is not installed."
+    exit 1
+fi
+
 # Backend Setup
 echo "Setting up backend..."
 if [ ! -d ".venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv .venv
+    $PYTHON_CMD -m venv .venv
 fi
 
-source .venv/bin/activate
+# Activate virtual environment (support both Unix and Windows/GitBash layouts)
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+elif [ -f ".venv/Scripts/activate" ]; then
+    source .venv/Scripts/activate
+else
+    echo "Error: Cannot find activate script in .venv (checked .venv/bin/activate and .venv/Scripts/activate)"
+    exit 1
+fi
 
 echo "Installing dependencies..."
 pip install -r requirements.txt
@@ -27,14 +45,13 @@ if [ -z "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
     else
         echo "Warning: GOOGLE_APPLICATION_CREDENTIALS not set and credentials.json not found."
         echo "Please set GOOGLE_APPLICATION_CREDENTIALS to a valid Google Cloud service account key file."
-        # Not creating dummy here because we want user to be aware
     fi
 fi
 
 # Start Backend
 echo "Starting backend..."
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
-python -m backend.main > backend.log 2>&1 &
+$PYTHON_CMD -m backend.main > backend.log 2>&1 &
 BACKEND_PID=$!
 echo "Backend running (PID: $BACKEND_PID)"
 
