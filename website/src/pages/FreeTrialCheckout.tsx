@@ -7,11 +7,16 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { CreditCard, CheckCircle2, ShieldCheck, Zap, Lock, Globe, Server } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import Header from "@/components/Header";
 
 const FreeTrialCheckout = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,6 +55,7 @@ const FreeTrialCheckout = () => {
 
   return (
     <div className="min-h-screen bg-background relative overflow-x-hidden selection:bg-primary/30 selection:text-white">
+      <Header />
       {/* Background Grid Animation */}
       <div className="fixed inset-0 retro-grid opacity-20 pointer-events-none" />
       <div className="fixed inset-0 bg-gradient-to-b from-background/50 via-transparent to-background pointer-events-none" />
@@ -97,7 +103,7 @@ const FreeTrialCheckout = () => {
 
             <div className="p-6 rounded-xl bg-primary/10 border border-primary/50 shadow-[0_0_30px_-5px_hsl(320,100%,55%,0.3)] backdrop-blur-sm relative overflow-hidden group">
               <div className="absolute inset-0 bg-gradient-to-r from-primary/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-              <p className="text-base text-white flex items-start gap-3 relative z-10">
+              <div className="text-base text-white flex items-start gap-3 relative z-10">
                 <div className="p-2 rounded-full bg-primary/20 text-primary">
                   <ShieldCheck className="w-5 h-5 animate-pulse" />
                 </div>
@@ -105,7 +111,7 @@ const FreeTrialCheckout = () => {
                   <strong className="text-primary text-lg block mb-1">Fast & Secure</strong>
                   <span className="text-gray-100/90 leading-relaxed">Your data is encrypted and processed with industry-leading security standards.</span>
                 </div>
-              </p>
+              </div>
             </div>
           </div>
 
