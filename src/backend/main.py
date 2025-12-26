@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
@@ -148,6 +148,73 @@ def _validate_upload(filename: str, content_type: str | None, size: int) -> None
     # Additional security: reject empty files
     if size == 0:
         raise HTTPException(status_code=400, detail="Empty files not allowed")
+
+
+def range_file_response(
+    path: Path,
+    range_header: str | None,
+    media_type: str = "application/octet-stream"
+):
+    """
+    Returns a StreamingResponse if a Range header is present,
+    otherwise returns a standard FileResponse.
+    """
+    file_size = path.stat().st_size
+    if not range_header:
+        return FileResponse(path=path, filename=path.name, media_type=media_type)
+
+    try:
+        # Parse standard Range header: "bytes=start-end"
+        unit, ranges = range_header.split("=")
+        if unit.strip().lower() != "bytes":
+             return FileResponse(path=path, filename=path.name, media_type=media_type)
+
+        start_str, end_str = ranges.split("-")
+
+        # Handle suffix range (e.g. bytes=-500) -> last 500 bytes
+        if not start_str and end_str:
+            suffix_length = int(end_str)
+            start = max(0, file_size - suffix_length)
+            end = file_size - 1
+        else:
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+
+        if start >= file_size:
+            # Requested range not satisfiable
+            return FileResponse(path=path, filename=path.name, media_type=media_type)
+
+        end = min(end, file_size - 1)
+        chunk_size = end - start + 1
+
+        def iter_file():
+            with open(path, "rb") as f:
+                f.seek(start)
+                bytes_read = 0
+                while bytes_read < chunk_size:
+                    chunk = f.read(min(8192, chunk_size - bytes_read))
+                    if not chunk:
+                        break
+                    yield chunk
+                    bytes_read += len(chunk)
+
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_size),
+        }
+
+        return StreamingResponse(
+            iter_file(),
+            status_code=206,
+            headers=headers,
+            media_type=media_type,
+        )
+
+    except Exception as e:
+        logger.error(f"Error parsing range header '{range_header}': {e}")
+        # Fallback
+        return FileResponse(path=path, filename=path.name, media_type=media_type)
 
 
 @asynccontextmanager
@@ -338,6 +405,7 @@ async def get_user_from_token_or_query(
 @app.get("/download/{media_id}")
 def download_media(
     media_id: int,
+    range_header: str | None = Header(None, alias="Range"),
     variant: str = Query("processed", regex="^(original|processed)$"),
     current_user: User = Depends(get_user_from_token_or_query),
     db: Session = Depends(get_db)
@@ -368,7 +436,7 @@ def download_media(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"{variant.capitalize()} file missing on disk")
 
-    return FileResponse(path=file_path, filename=file_path.name, media_type="application/octet-stream")
+    return range_file_response(file_path, range_header, media_type="application/octet-stream")
 
 
 @app.delete("/media/{media_id}", response_model=MessageResponse)
@@ -427,6 +495,7 @@ def list_output_files(
 @app.get("/outputs/files/{filename}")
 def get_output_file(
     filename: str,
+    range_header: str | None = Header(None, alias="Range"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -457,7 +526,16 @@ def get_output_file(
     if not media:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    return FileResponse(path=file_path)
+    # Determine media type based on extension
+    media_type = "application/octet-stream"
+    if file_path.suffix in {".mp4", ".m4v"}:
+        media_type = "video/mp4"
+    elif file_path.suffix in {".mp3"}:
+        media_type = "audio/mpeg"
+    elif file_path.suffix in {".wav"}:
+        media_type = "audio/wav"
+
+    return range_file_response(file_path, range_header, media_type=media_type)
 
 @app.delete("/outputs/files/{filename}", response_model=MessageResponse)
 def delete_output_file(
