@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
 import { Download, RotateCcw, Check, Share2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getDownloadUrl, MediaResponse } from "@/lib/api";
@@ -14,10 +14,25 @@ interface OutputPreviewProps {
 
 const OutputPreview = ({ fileName, fileType, filterMode, onReset, media }: OutputPreviewProps) => {
   const [viewMode, setViewMode] = useState<"original" | "filtered">("filtered");
+  const [currentTime, setCurrentTime] = useState(0);
+  const [shouldAutoPlay, setShouldAutoPlay] = useState(false);
+
+  // Reset state when media changes (e.g. new upload processed)
+  useEffect(() => {
+    setCurrentTime(0);
+    setShouldAutoPlay(false);
+  }, [media.id]);
 
   const toggleViewMode = () => {
     setViewMode((prev) => (prev === "filtered" ? "original" : "filtered"));
+    setShouldAutoPlay(true);
   };
+
+  const handleTimeUpdate = useCallback((time: number) => {
+    setCurrentTime(time);
+  }, []);
+
+
 
   const downloadUrl = viewMode === "filtered"
     ? getDownloadUrl(media.id, "processed")
@@ -31,14 +46,14 @@ const OutputPreview = ({ fileName, fileType, filterMode, onReset, media }: Outpu
     const processTime = Math.max(0, (endTime - startTime) / 1000).toFixed(1) + "s";
 
     const totalDurationMs = media.segments.reduce((acc, segment) => {
-        return acc + (segment.end_ms - segment.start_ms);
+      return acc + (segment.end_ms - segment.start_ms);
     }, 0);
     const totalDurationFiltered = (totalDurationMs / 1000).toFixed(1) + "s";
 
     return {
-        itemsFiltered,
-        processTime,
-        totalDurationFiltered
+      itemsFiltered,
+      processTime,
+      totalDurationFiltered
     };
   }, [media]);
 
@@ -62,6 +77,10 @@ const OutputPreview = ({ fileName, fileType, filterMode, onReset, media }: Outpu
         type={fileType}
         className="w-full aspect-video"
         segments={media.segments}
+        // Sync playback state
+        initialTime={currentTime}
+        initialIsPlaying={shouldAutoPlay}
+        onTimeUpdate={handleTimeUpdate}
       />
 
       {/* Comparison toggle */}
@@ -69,13 +88,13 @@ const OutputPreview = ({ fileName, fileType, filterMode, onReset, media }: Outpu
         <span className={cn("text-sm transition-colors", viewMode === "original" ? "text-foreground font-medium" : "text-muted-foreground")}>Original</span>
 
         <button
-            onClick={toggleViewMode}
-            className="w-12 h-6 rounded-full bg-primary/20 p-1 cursor-pointer relative transition-colors hover:bg-primary/30"
+          onClick={toggleViewMode}
+          className="w-12 h-6 rounded-full bg-primary/20 p-1 cursor-pointer relative transition-colors hover:bg-primary/30"
         >
           <div
             className={cn(
-                "w-4 h-4 rounded-full bg-primary shadow-[0_0_10px_theme(colors.primary.DEFAULT)] transition-transform duration-300",
-                viewMode === "filtered" ? "translate-x-6" : "translate-x-0"
+              "w-4 h-4 rounded-full bg-primary shadow-[0_0_10px_theme(colors.primary.DEFAULT)] transition-transform duration-300",
+              viewMode === "filtered" ? "translate-x-6" : "translate-x-0"
             )}
           />
         </button>

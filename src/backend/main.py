@@ -3,16 +3,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
+from dotenv import load_dotenv
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile
+# Load environment variables from .env file
+load_dotenv()
+
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
-import sys
 
 # Force UTF-8 encoding for stdout/stderr on Windows to avoid charmap errors
 if hasattr(sys.stdout, "reconfigure"):
@@ -20,9 +24,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-
 from .db import get_db, init_db
+# Removed User and auth-related models from import
 from .models import CensorSegment, ProcessStatus, ProcessedMedia, utc_now
+# Removed auth-related schemas from import
 from .schemas import HealthResponse, MediaListResponse, MediaResponse, MessageResponse, RawFileResponse, SegmentResponse, StatsResponse
 from .services.pipeline_wrapper import process_media
 
@@ -119,13 +124,94 @@ def _to_response(media: ProcessedMedia) -> MediaResponse:
 
 
 def _validate_upload(filename: str, content_type: str | None, size: int) -> None:
+    """Validate uploaded file with security checks."""
+    # Security: Prevent path traversal and malicious filenames
+    if not filename or ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    # Validate extension
     ext = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"File type not allowed: {ext}")
+    
+    # Validate MIME type
     if content_type and content_type not in ALLOWED_MIMETYPES:
         raise HTTPException(status_code=400, detail=f"Invalid content type: {content_type}")
+    
+    # Validate file size
     if size > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail=f"File too large. Max: {MAX_FILE_SIZE // (1024*1024)}MB")
+    
+    # Additional security: reject empty files
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Empty files not allowed")
+
+
+def range_file_response(
+    path: Path, 
+    range_header: str | None, 
+    media_type: str = "application/octet-stream"
+):
+    """
+    Returns a StreamingResponse if a Range header is present,
+    otherwise returns a standard FileResponse.
+    """
+    file_size = path.stat().st_size
+    if not range_header:
+        return FileResponse(path=path, filename=path.name, media_type=media_type)
+
+    try:
+        # Parse standard Range header: "bytes=start-end"
+        unit, ranges = range_header.split("=")
+        if unit.strip().lower() != "bytes":
+             return FileResponse(path=path, filename=path.name, media_type=media_type)
+        
+        start_str, end_str = ranges.split("-")
+        
+        # Handle suffix range (e.g. bytes=-500) -> last 500 bytes
+        if not start_str and end_str:
+            suffix_length = int(end_str)
+            start = max(0, file_size - suffix_length)
+            end = file_size - 1
+        else:
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+        
+        if start >= file_size:
+            # Requested range not satisfiable
+            return FileResponse(path=path, filename=path.name, media_type=media_type)
+
+        end = min(end, file_size - 1)
+        chunk_size = end - start + 1
+
+        def iter_file():
+            with open(path, "rb") as f:
+                f.seek(start)
+                bytes_read = 0
+                while bytes_read < chunk_size:
+                    chunk = f.read(min(8192, chunk_size - bytes_read))
+                    if not chunk:
+                        break
+                    yield chunk
+                    bytes_read += len(chunk)
+
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(chunk_size),
+        }
+        
+        return StreamingResponse(
+            iter_file(),
+            status_code=206,
+            headers=headers,
+            media_type=media_type,
+        )
+
+    except Exception as e:
+        logger.error(f"Error parsing range header '{range_header}': {e}")
+        # Fallback
+        return FileResponse(path=path, filename=path.name, media_type=media_type)
 
 
 @asynccontextmanager
@@ -138,7 +224,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AegisAI",
+    title="AegisAI (No Auth)",
     version="1.0.0",
     lifespan=lifespan,
     root_path="/api",
@@ -158,20 +244,27 @@ def health():
 
 
 @app.get("/stats", response_model=StatsResponse)
-def get_stats(db: Session = Depends(get_db)):
-    total_media = db.query(ProcessedMedia).count()
-    total_segments = db.query(CensorSegment).count()
+def get_stats(
+    db: Session = Depends(get_db)
+):
+    """Get statistics for all media."""
+    # Removed user_id filtering
+    query = db.query(ProcessedMedia)
+    total_media = query.count()
+    
+    media_ids = [m.id for m in query.all()]
+    total_segments = db.query(CensorSegment).filter(CensorSegment.media_id.in_(media_ids)).count() if media_ids else 0
 
     by_status = {
-        ProcessStatus.CREATED: db.query(ProcessedMedia).filter(ProcessedMedia.status == ProcessStatus.CREATED).count(),
-        ProcessStatus.PROCESSING: db.query(ProcessedMedia).filter(ProcessedMedia.status == ProcessStatus.PROCESSING).count(),
-        ProcessStatus.DONE: db.query(ProcessedMedia).filter(ProcessedMedia.status == ProcessStatus.DONE).count(),
-        ProcessStatus.FAILED: db.query(ProcessedMedia).filter(ProcessedMedia.status == ProcessStatus.FAILED).count(),
+        ProcessStatus.CREATED: query.filter(ProcessedMedia.status == ProcessStatus.CREATED).count(),
+        ProcessStatus.PROCESSING: query.filter(ProcessedMedia.status == ProcessStatus.PROCESSING).count(),
+        ProcessStatus.DONE: query.filter(ProcessedMedia.status == ProcessStatus.DONE).count(),
+        ProcessStatus.FAILED: query.filter(ProcessedMedia.status == ProcessStatus.FAILED).count(),
     }
 
     by_type = {}
-    for row in db.query(ProcessedMedia.input_type).distinct():
-        by_type[row[0]] = db.query(ProcessedMedia).filter(ProcessedMedia.input_type == row[0]).count()
+    for row in query.with_entities(ProcessedMedia.input_type).distinct():
+        by_type[row[0]] = query.filter(ProcessedMedia.input_type == row[0]).count()
 
     return StatsResponse(total_media=total_media, total_segments=total_segments, by_status=by_status, by_type=by_type)
 
@@ -183,6 +276,8 @@ def list_media(
     status: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    """List all media files."""
+    # Removed user_id filtering
     query = db.query(ProcessedMedia)
     if status:
         query = query.filter(ProcessedMedia.status == status)
@@ -194,8 +289,15 @@ def list_media(
 
 
 @app.get("/media/{media_id}", response_model=MediaResponse)
-def get_media(media_id: int, db: Session = Depends(get_db)):
-    media = db.query(ProcessedMedia).filter(ProcessedMedia.id == media_id).first()
+def get_media(
+    media_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get a specific media file."""
+    # Removed user_id filtering
+    media = db.query(ProcessedMedia).filter(
+        ProcessedMedia.id == media_id
+    ).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
     return _to_response(media)
@@ -204,10 +306,15 @@ def get_media(media_id: int, db: Session = Depends(get_db)):
 @app.get("/download/{media_id}")
 def download_media(
     media_id: int,
+    range_header: str | None = Header(None, alias="Range"),
     variant: str = Query("processed", regex="^(original|processed)$"),
     db: Session = Depends(get_db)
 ):
-    media = db.query(ProcessedMedia).filter(ProcessedMedia.id == media_id).first()
+    """Download a media file."""
+    # Removed user_id filtering
+    media = db.query(ProcessedMedia).filter(
+        ProcessedMedia.id == media_id
+    ).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
 
@@ -229,12 +336,19 @@ def download_media(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"{variant.capitalize()} file missing on disk")
 
-    return FileResponse(path=file_path, filename=file_path.name, media_type="application/octet-stream")
+    return range_file_response(file_path, range_header, media_type="application/octet-stream")
 
 
 @app.delete("/media/{media_id}", response_model=MessageResponse)
-def delete_media(media_id: int, db: Session = Depends(get_db)):
-    media = db.query(ProcessedMedia).filter(ProcessedMedia.id == media_id).first()
+def delete_media(
+    media_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete a media file."""
+    # Removed user_id filtering
+    media = db.query(ProcessedMedia).filter(
+        ProcessedMedia.id == media_id
+    ).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
 
@@ -253,11 +367,19 @@ def delete_media(media_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/outputs/files", response_model=list[RawFileResponse])
-def list_output_files():
+def list_output_files(
+    db: Session = Depends(get_db)
+):
+    """List output files."""
+    # Get all output paths for all media
+    all_media = db.query(ProcessedMedia).all()
+    known_output_paths = {Path(m.output_path).name for m in all_media if m.output_path}
+    
     files = []
     if OUTPUTS_DIR.exists():
         for path in OUTPUTS_DIR.iterdir():
-            if path.is_file():
+            # Only list files that are known to the DB (optional, but keeps consistency)
+            if path.is_file() and path.name in known_output_paths:
                 # Get modification time
                 stats = path.stat()
                 files.append(
@@ -270,23 +392,68 @@ def list_output_files():
 
 
 @app.get("/outputs/files/{filename}")
-def get_output_file(filename: str):
+def get_output_file(
+    filename: str,
+    range_header: str | None = Header(None, alias="Range"),
+    db: Session = Depends(get_db)
+):
+    """Get an output file."""
     file_path = OUTPUTS_DIR / filename
-    # Security check: prevent directory traversal
-    if not file_path.resolve().is_relative_to(OUTPUTS_DIR.resolve()):
-         raise HTTPException(status_code=403, detail="Access denied")
+    # Security check: prevent directory traversal and path manipulation
+    try:
+        resolved_path = file_path.resolve()
+        resolved_outputs = OUTPUTS_DIR.resolve()
+        if not str(resolved_path).startswith(str(resolved_outputs)):
+            raise HTTPException(status_code=403, detail="Access denied")
+        # Additional check: ensure no parent directory traversal
+        if ".." in filename or filename.startswith("/") or "\\" in filename:
+            raise HTTPException(status_code=403, detail="Invalid filename")
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+    
+    # Optional: Verify file exists in DB to prevent accessing random files if directory is shared
+    target_path = str(file_path.resolve())
+    media = db.query(ProcessedMedia).filter(
+        ProcessedMedia.output_path == target_path
+    ).first()
+    
+    if not media:
+        # If strict correlation with DB is required, uncomment next line
+        # raise HTTPException(status_code=403, detail="Access denied")
+        pass
 
-    return FileResponse(path=file_path)
+    # Determine media type based on extension
+    media_type = "application/octet-stream"
+    if file_path.suffix in {".mp4", ".m4v"}:
+        media_type = "video/mp4"
+    elif file_path.suffix in {".mp3"}:
+        media_type = "audio/mpeg"
+    elif file_path.suffix in {".wav"}:
+        media_type = "audio/wav"
+
+    return range_file_response(file_path, range_header, media_type=media_type)
+
 
 @app.delete("/outputs/files/{filename}", response_model=MessageResponse)
-def delete_output_file(filename: str, db: Session = Depends(get_db)):
+def delete_output_file(
+    filename: str,
+    db: Session = Depends(get_db)
+):
+    """Delete an output file."""
     file_path = OUTPUTS_DIR / filename
     # Security check: prevent directory traversal
-    if not file_path.resolve().is_relative_to(OUTPUTS_DIR.resolve()):
-         raise HTTPException(status_code=403, detail="Access denied")
+    try:
+        resolved_path = file_path.resolve()
+        resolved_outputs = OUTPUTS_DIR.resolve()
+        if not str(resolved_path).startswith(str(resolved_outputs)):
+            raise HTTPException(status_code=403, detail="Access denied")
+        if ".." in filename or filename.startswith("/") or "\\" in filename:
+            raise HTTPException(status_code=403, detail="Invalid filename")
+    except (ValueError, OSError):
+        raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -295,7 +462,9 @@ def delete_output_file(filename: str, db: Session = Depends(get_db)):
     target_path = str(file_path.resolve())
 
     # Find associated media record
-    media = db.query(ProcessedMedia).filter(ProcessedMedia.output_path == target_path).first()
+    media = db.query(ProcessedMedia).filter(
+        ProcessedMedia.output_path == target_path
+    ).first()
 
     if media:
         input_path = Path(media.input_path) if media.input_path else None
@@ -317,11 +486,12 @@ def delete_output_file(filename: str, db: Session = Depends(get_db)):
     
 @app.get("/debug/logs", response_class=PlainTextResponse)
 def get_logs():
+    """Get backend logs."""
     log_path = Path("backend.log")
     if not log_path.exists():
         return ""
     try:
-        # Read file content directly to avoid Content-Length mismatch issues with FileResponse on active log files
+        # Read file content directly
         with open(log_path, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
@@ -342,9 +512,6 @@ def run_pipeline_background(media_id: int, db: Session):
 
         def progress_callback(progress: int, activity: str):
             try:
-                # Re-fetch to avoid stale object? 
-                # Or just update inplace if session is alive.
-                # Just separate transaction might be safer if frequent updates.
                 media.progress = progress
                 media.current_activity = activity
                 
@@ -450,6 +617,7 @@ async def process_file(
     input_type = _detect_input_type(upload_path)
     file_hash = _compute_file_hash(upload_path)
 
+    # Check for existing media with same hash and filters (Global check now, not per-user)
     existing = (
         db.query(ProcessedMedia)
         .filter(
@@ -467,6 +635,7 @@ async def process_file(
         upload_path.unlink()
         return _to_response(existing)
 
+    # Removed user_id assignment
     media = ProcessedMedia(
         input_path=str(upload_path),
         input_type=input_type,
@@ -489,4 +658,4 @@ async def process_file(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
